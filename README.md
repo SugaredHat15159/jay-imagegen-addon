@@ -1,6 +1,6 @@
 # JAY Image Generation Addon
 
-**Author: Alex Stan** · A [JAY](https://github.com/SugaredHat15159/Jay) addon.
+**Author: SugaredHat15159** · A [JAY](https://github.com/SugaredHat15159/Jay) addon.
 
 Generate images from a spoken prompt, entirely on your own hardware. This addon
 runs Stability AI's **sd-turbo** on CPU (no GPU required), serves the result over
@@ -121,5 +121,5 @@ they pass through to the rest of JAY.
 ## License
 
 JAY Personal-Use License — see [LICENSE](LICENSE). Free for personal and
-non-commercial use with attribution to **Alex Stan**. Commercial use requires
+non-commercial use with attribution to **SugaredHat15159**. Commercial use requires
 written permission.

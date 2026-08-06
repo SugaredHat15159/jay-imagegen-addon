@@ -10,7 +10,7 @@ This is a JAY addon. It plugs into JAY purely over MQTT:
   subscribes: skill/imagegen/request
   publishes:  tts/request, skill/imagegen/state, pc/command/<machine>
 
-Author: Alex Stan
+Author: SugaredHat15159
 """
 import os
 import io
@@ -54,6 +54,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 GEN_LOCK = threading.Lock()   # single-flight: one generation at a time
 _pipe = None
 _pipe_lock = threading.Lock()
+_safety = None          # (checker, feature_extractor) tuple, loaded once
+_safety_lock = threading.Lock()
 
 
 def utc_now_iso():
@@ -76,6 +78,31 @@ def _load_pipe():
         _pipe = p
         logger.info("Model ready in %.1fs", time.time() - t0)
         return _pipe
+
+
+def _load_safety():
+    """Load the Stable Diffusion safety checker once, keep resident.
+
+    sd-turbo ships without a safety checker, so we load CompVis's checker
+    explicitly and run every generated image through it. This is what makes
+    'safety always on' real rather than nominal.
+    """
+    global _safety
+    with _safety_lock:
+        if _safety is not None:
+            return _safety
+        from diffusers.pipelines.stable_diffusion.safety_checker import (
+            StableDiffusionSafetyChecker)
+        from transformers import CLIPImageProcessor
+        logger.info("Loading safety checker...")
+        t0 = time.time()
+        checker = StableDiffusionSafetyChecker.from_pretrained(
+            "CompVis/stable-diffusion-safety-checker")
+        extractor = CLIPImageProcessor.from_pretrained(
+            "CompVis/stable-diffusion-safety-checker")
+        _safety = (checker, extractor)
+        logger.info("Safety checker ready in %.1fs", time.time() - t0)
+        return _safety
 
 
 def reap_old(_now=None):
@@ -110,12 +137,18 @@ def generate(prompt):
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
-        # Safety is ALWAYS on. If the pipeline flags NSFW, block unconditionally.
-        nsfw = False
-        flags = getattr(result, "nsfw_content_detected", None)
-        if flags and any(flags):
-            nsfw = True
-        logger.info("Generated in %.1fs (nsfw=%s)", time.time() - t0, nsfw)
+        logger.info("Generated in %.1fs", time.time() - t0)
+    # Safety is ALWAYS on. Run the generated image through the checker
+    # explicitly (sd-turbo has no built-in one). Done outside GEN_LOCK so a
+    # slow check doesn't block the next request's queue position.
+    import numpy as _np
+    checker, extractor = _load_safety()
+    safety_input = extractor(images=img, return_tensors="pt")
+    _checked, has_nsfw = checker(
+        images=[_np.array(img)],
+        clip_input=safety_input.pixel_values)
+    nsfw = bool(has_nsfw[0]) if has_nsfw else False
+    logger.info("Safety check: nsfw=%s", nsfw)
     if nsfw:
         raise ValueError("blocked_nsfw")
     image_id = f"img_{uuid.uuid4().hex[:10]}"
@@ -143,11 +176,12 @@ def publish_state(status, **extra):
 
 
 def handle_request(req):
-    prompt = (req.get("prompt") or req.get("text") or "").strip()
-    # An addon-matched request carries data from the manifest's named groups.
+    # An addon-matched request carries the extracted subject in data (from the
+    # manifest's named groups). Prefer that over the raw text, which still holds
+    # the trigger verb ("draw a dog" -> subject "dog"). Fall back to prompt/text
+    # for direct (non-addon) requests.
     data = req.get("data") or {}
-    if not prompt and data.get("subject"):
-        prompt = data["subject"].strip()
+    prompt = (data.get("subject") or req.get("prompt") or req.get("text") or "").strip()
     machine = (req.get("machine") or data.get("machine") or DEFAULT_PC).strip() or DEFAULT_PC
     source = req.get("source")
     if not prompt:
@@ -231,6 +265,7 @@ if __name__ == "__main__":
     threading.Thread(target=serve_http, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
     threading.Thread(target=_load_pipe, daemon=True).start()
+    threading.Thread(target=_load_safety, daemon=True).start()
     _dl = time.time() + 60
     while True:
         try:

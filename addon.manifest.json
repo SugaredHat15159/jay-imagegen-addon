@@ -3,7 +3,7 @@
   "name": "imagegen",
   "display_name": "Image Generation (sd-turbo, CPU)",
   "version": "1.0.0",
-  "author": "Alex Stan",
+  "author": "SugaredHat15159",
   "description": "Generate images from a spoken prompt on the server (CPU sd-turbo), then open the result on a chosen PC. Safety filter always on.",
   "skill_topic": "imagegen",
   "service": {
