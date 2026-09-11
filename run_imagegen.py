@@ -103,7 +103,11 @@ def _load_pipe():
         from diffusers import AutoPipelineForText2Image
         logger.info("Loading %s (model=%s, threads=%d)...", MODEL_NAME, MODEL_ID, IMAGE_THREADS)
         t0 = time.time()
-        p = AutoPipelineForText2Image.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
+        load_kw = dict(torch_dtype=torch.float32)
+        if ENABLE_NSFW:
+            load_kw["safety_checker"] = None
+            load_kw["requires_safety_checker"] = False
+        p = AutoPipelineForText2Image.from_pretrained(MODEL_ID, **load_kw)
         p.set_progress_bar_config(disable=True)
         _pipe = p
         logger.info("Model ready in %.1fs", time.time() - t0)
