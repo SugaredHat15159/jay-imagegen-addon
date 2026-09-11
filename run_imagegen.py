@@ -142,7 +142,7 @@ def fit_dims(w, h, cap=512):
     return _r8(out_w), _r8(out_h)
 
 
-
+def reap_old(_now=None):
     now = _now or time.time()
     for f in glob.glob(os.path.join(OUT_DIR, "*.png")):
         try:
