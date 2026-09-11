@@ -1,10 +1,14 @@
-"""JAY Image Generation Addon — CPU sd-turbo text-to-image.
+"""JAY Image Generation Addon — CPU sd-turbo / LCM text-to-image.
 
 Generates on the server (thread-capped, single-flight), serves the PNG on a
 dedicated HTTP port, tells a PC to open the URL, and auto-deletes the file
 after a TTL so storage never grows.
 
-Safety is ALWAYS ON. There is no toggle. Any image the checker flags is blocked.
+Supports two models:
+  - SD-Turbo (1 step, fast, lower quality, CPU-safe)
+  - LCM (4 steps, medium quality, CPU-safe)
+
+Safety filter is configurable via ENABLE_NSFW bool.
 
 This is a JAY addon. It plugs into JAY purely over MQTT:
   subscribes: skill/imagegen/request
@@ -12,6 +16,14 @@ This is a JAY addon. It plugs into JAY purely over MQTT:
 
 Author: Alex Stan
 """
+
+# ============================================================================
+# CONFIGURATION: Modify these bools to swap models and safety behavior
+# ============================================================================
+USE_LCM = False          # True = LCM (4-step), False = SD-Turbo (1-step)
+ENABLE_NSFW = False      # True = allow NSFW, False = block NSFW (safety ON)
+# ============================================================================
+
 import os
 import io
 import json
@@ -36,8 +48,18 @@ logger = logging.getLogger("imagegen-addon")
 
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
-STEPS = int(os.getenv("IMAGE_STEPS", "4"))
+
+# Model selection based on USE_LCM flag
+if USE_LCM:
+    MODEL_ID = os.getenv("IMAGE_MODEL", "latent-consistency/lcm-lsm8-mpo-sd1.5")
+    DEFAULT_STEPS = 4
+    MODEL_NAME = "LCM"
+else:
+    MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
+    DEFAULT_STEPS = 1
+    MODEL_NAME = "SD-Turbo"
+
+STEPS = int(os.getenv("IMAGE_STEPS", str(DEFAULT_STEPS)))
 SIZE = int(os.getenv("IMAGE_SIZE", "512"))
 ALLOWED_SIZES = {512, 768}
 HTTP_PORT = int(os.getenv("IMAGE_HTTP_PORT", "8137"))
@@ -61,7 +83,7 @@ def utc_now_iso():
 
 
 def _load_pipe():
-    """Load sd-turbo once, keep resident. Heavy import kept lazy."""
+    """Load model once, keep resident. Heavy import kept lazy."""
     global _pipe
     with _pipe_lock:
         if _pipe is not None:
@@ -69,7 +91,7 @@ def _load_pipe():
         import torch
         torch.set_num_threads(IMAGE_THREADS)
         from diffusers import AutoPipelineForText2Image
-        logger.info("Loading %s (threads=%d)...", MODEL_ID, IMAGE_THREADS)
+        logger.info("Loading %s (model=%s, threads=%d)...", MODEL_NAME, MODEL_ID, IMAGE_THREADS)
         t0 = time.time()
         p = AutoPipelineForText2Image.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
         p.set_progress_bar_config(disable=True)
@@ -99,7 +121,7 @@ def reaper_loop():
 
 
 def generate(prompt):
-    """Return (image_id, path) or raise. Safety is always enforced."""
+    """Return (image_id, path) or raise. Safety is conditional on ENABLE_NSFW."""
     pipe = _load_pipe()
     import torch
     reap_old()  # prune before each gen so nothing piles up
@@ -110,14 +132,20 @@ def generate(prompt):
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
-        # Safety is ALWAYS on. If the pipeline flags NSFW, block unconditionally.
+        
+        # Safety check: only enforce if ENABLE_NSFW is False
         nsfw = False
-        flags = getattr(result, "nsfw_content_detected", None)
-        if flags and any(flags):
-            nsfw = True
-        logger.info("Generated in %.1fs (nsfw=%s)", time.time() - t0, nsfw)
+        if not ENABLE_NSFW:
+            flags = getattr(result, "nsfw_content_detected", None)
+            if flags and any(flags):
+                nsfw = True
+        
+        logger.info("Generated in %.1fs (nsfw=%s, safety=%s)", 
+                    time.time() - t0, nsfw, "ON" if not ENABLE_NSFW else "OFF")
+    
     if nsfw:
         raise ValueError("blocked_nsfw")
+    
     image_id = f"img_{uuid.uuid4().hex[:10]}"
     path = os.path.join(OUT_DIR, image_id + ".png")
     img.save(path)
@@ -135,9 +163,15 @@ def publish_tts(text, source=None):
 
 
 def publish_state(status, **extra):
-    # Safety is a fixed, non-toggleable property of this addon: always true.
-    payload = {"skill": SKILL, "timestamp": utc_now_iso(), "status": status,
-               "safety": True, "size": SIZE}
+    payload = {
+        "skill": SKILL,
+        "timestamp": utc_now_iso(),
+        "status": status,
+        "model": MODEL_NAME,
+        "safety": not ENABLE_NSFW,  # True = safety ON, False = safety OFF
+        "size": SIZE,
+        "steps": STEPS
+    }
     payload.update(extra)
     client.publish(f"skill/{SKILL}/state", json.dumps(payload), qos=1, retain=True)
 
@@ -226,8 +260,8 @@ def serve_http():
 
 if __name__ == "__main__":
     logger.info("JAY Image Generation Addon starting "
-                "(model=%s, steps=%d, size=%d, threads=%d, safety=ALWAYS ON)",
-                MODEL_ID, STEPS, SIZE, IMAGE_THREADS)
+                "(model=%s, steps=%d, size=%d, threads=%d, safety=%s)",
+                MODEL_NAME, STEPS, SIZE, IMAGE_THREADS, "ON" if not ENABLE_NSFW else "OFF")
     threading.Thread(target=serve_http, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
     threading.Thread(target=_load_pipe, daemon=True).start()

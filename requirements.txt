@@ -1,6 +1,8 @@
+# JAY Image Generation Addon — CPU models (SD-Turbo / LCM)
+# Versions tuned for CPU inference, single-flight generation
 paho-mqtt>=2.0.0
 numpy
-diffusers==0.31.0
+diffusers==0.31.0    # Supports both SD and LCM models
 transformers==4.44.2
 accelerate==0.34.2
 pillow

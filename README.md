@@ -3,12 +3,16 @@
 **Author: Alex Stan** · A [JAY](https://github.com/SugaredHat15159/Jay) addon.
 
 Generate images from a spoken prompt, entirely on your own hardware. This addon
-runs Stability AI's **sd-turbo** on CPU (no GPU required), serves the result over
-a local HTTP port, and opens it on the PC of your choice. Generated images
-auto-delete after a short TTL so storage never grows.
+runs image generation on CPU (no GPU required), serves the result over a local
+HTTP port, and opens it on the PC of your choice. Generated images auto-delete
+after a short TTL so storage never grows.
 
-**The safety filter is always on.** There is no NSFW toggle. Any image the
-checker flags is blocked.
+**Supports two models:**
+
+- **SD-Turbo** (default) — 1-step, ~1–2 min on CPU, lower quality, fastest
+- **LCM (Latent Consistency)** — 4-step, ~4–8 min on CPU, better quality
+
+**Safety filter is configurable:** Block NSFW or allow it, by editing a bool in the code.
 
 ---
 
@@ -21,9 +25,8 @@ Say something like:
 - *"draw a dog"*
 - *"generate an image of a mountain lake on desktop"*
 
-JAY generates the image on the server (~15s at 512px, ~30s at 768px on a modern
-CPU), then tells your PC to open the resulting PNG in the browser. The file is
-deleted automatically after 10 minutes.
+JAY generates the image on the server, then tells your PC to open the resulting
+PNG in the browser. The file is deleted automatically after 10 minutes.
 
 ---
 
@@ -33,8 +36,8 @@ deleted automatically after 10 minutes.
   system installed (`addon.sh`, addon loader).
 - The JAY PC Agent running on whichever machine should display the image (it
   handles the `open_url` command).
-- ~3 GB RAM free during generation and ~2.5 GB disk for the model cache (first
-  run downloads sd-turbo from Hugging Face).
+- ~3–4 GB RAM free during generation and ~2.5–3.5 GB disk for the model cache
+  (first run downloads the model from Hugging Face).
 
 ---
 
@@ -64,7 +67,7 @@ cd /srv/jay
 ./addon.sh rebuild
 ```
 
-The **first generation** is slow — it downloads the sd-turbo model (~2.5 GB) and
+The **first generation** is slow — it downloads the model (~2.5–3.5 GB) and
 loads it into memory. Subsequent generations are fast and the model stays
 resident.
 
@@ -72,20 +75,51 @@ resident.
 
 ## Configuration
 
-All configuration is via `.env` (copy from `.env.example`):
+### Code toggles (edit `run_imagegen.py`)
+
+At the top of `run_imagegen.py`, two configuration bools control the addon's behavior:
+
+```python
+# CONFIGURATION: Modify these bools to swap models and safety behavior
+USE_LCM = False          # True = LCM (4-step), False = SD-Turbo (1-step)
+ENABLE_NSFW = False      # True = allow NSFW, False = block NSFW (safety ON)
+```
+
+- **`USE_LCM`**: Switch between models.
+  - `False` (default) → SD-Turbo: 1 step, ~1–2 min, lower quality
+  - `True` → LCM: 4 steps, ~4–8 min, better quality
+- **`ENABLE_NSFW`**: Toggle the safety filter.
+  - `False` (default) → Safety filter ON: block NSFW images
+  - `True` → Safety filter OFF: allow NSFW images
+
+To change settings, edit those two lines, save, rebuild the container:
+
+```bash
+cd /srv/jay/addons/imagegen
+# Edit run_imagegen.py
+docker compose build jay-imagegen-addon
+docker compose up -d jay-imagegen-addon
+```
+
+### Environment variables (`.env`)
+
+All environment configuration:
 
 | Variable            | Default                   | Meaning                                            |
 |---------------------|---------------------------|----------------------------------------------------|
 | `MQTT_HOST`         | `127.0.0.1`               | JAY broker host.                                   |
 | `MQTT_PORT`         | `1883`                    | JAY broker port (local anon).                      |
-| `IMAGE_MODEL`       | `stabilityai/sd-turbo`    | Diffusers model id.                                |
 | `IMAGE_THREADS`     | `4`                       | CPU threads for generation.                        |
-| `IMAGE_STEPS`       | `4`                       | Inference steps (sd-turbo is a few-step model).    |
 | `IMAGE_SIZE`        | `512`                     | Output size in px (512 or 768).                    |
 | `IMAGE_HTTP_PORT`   | `8137`                    | Port the generated PNG is served on.               |
 | `IMAGE_HOST_ADDR`   | `100.119.255.57`          | Address PCs reach to fetch the image (tailnet IP). |
 | `IMAGE_TTL_SECONDS` | `600`                     | Delete PNGs after this many seconds.               |
 | `DEFAULT_PC`        | `laptop`                  | Which PC opens the image if none is named.         |
+
+**Note:** `IMAGE_MODEL` and `IMAGE_STEPS` are now controlled by the code toggles
+(`USE_LCM` and default steps per model), not by environment variables. If you
+want to override the model ID, you can still set `IMAGE_MODEL` in the `.env`
+and it will be used; otherwise the defaults are chosen based on `USE_LCM`.
 
 ---
 
@@ -115,6 +149,18 @@ display target.
 
 Common non-image phrases ("draw the curtains", "draw me a bath") are excluded so
 they pass through to the rest of JAY.
+
+---
+
+## Model comparison
+
+| Aspect | SD-Turbo | LCM |
+|--------|----------|-----|
+| **Steps** | 1 | 4 |
+| **Time (CPU)** | ~1–2 min | ~4–8 min |
+| **Quality** | Poor (blurry) | Better |
+| **Safety** | Configurable | Configurable |
+| **Best for** | Quick previews | Higher-quality output |
 
 ---
 

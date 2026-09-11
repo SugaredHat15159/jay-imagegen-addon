@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "name": "imagegen",
+  "display_name": "Image Generation (SD-Turbo / LCM, CPU)",
+  "version": "2.0.0",
+  "author": "Alex Stan",
+  "description": "Generate images from a spoken prompt on the server (CPU only). Supports SD-Turbo (1-step, fast, lower quality) or LCM (4-step, better quality). Safety filter and NSFW toggle configurable in code.",
+  "skill_topic": "imagegen",
+  "service": {
+    "container_name": "jay-imagegen-addon",
+    "build_context": "./addons/imagegen",
+    "network_mode": "host",
+    "env_file": "./addons/imagegen/.env",
+    "environment": {
+      "MQTT_HOST": "127.0.0.1",
+      "MQTT_PORT": "1883",
+      "IMAGE_THREADS": "4",
+      "IMAGE_HTTP_PORT": "8137",
+      "IMAGE_HOST_ADDR": "100.119.255.57",
+      "IMAGE_TTL_SECONDS": "600",
+      "IMAGE_OUT_DIR": "/app/data/out",
+      "DEFAULT_PC": "laptop"
+    },
+    "volumes": [
+      "imagegen_data:/app/data",
+      "imagegen_models:/root/.cache/huggingface"
+    ]
+  },
+  "intents": [
+    {
+      "intent": "imagegen_create",
+      "patterns": [
+        "\\b(?:generate|make|create|render)\\s+(?:me\\s+)?(?:an?\\s+)?(?:image|picture|photo|drawing|painting)\\s+of\\s+(?P<subject>.+?)(?:\\s+on\\s+(?P<machine>desktop|laptop))?$",
+        "\\b(?:draw|paint|sketch)\\s+(?!me\\s+a\\s+bath\\b)(?:me\\s+)?(?:a\\s+picture\\s+of\\s+|an?\\s+)?(?!the\\s+(?:curtains?|blinds?|shades?|drapes?)\\b)(?P<subject>.+?)(?:\\s+on\\s+(?P<machine>desktop|laptop))?$"
+      ],
+      "data_from_groups": [
+        "subject",
+        "machine"
+      ]
+    }
+  ],
+  "voice_examples": [
+    "generate an image of a red barn at sunset",
+    "make a picture of a robot playing chess",
+    "draw a dog",
+    "generate an image of a mountain lake on desktop"
+  ]
+}
