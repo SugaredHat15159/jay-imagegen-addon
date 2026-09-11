@@ -20,7 +20,7 @@ Author: Alex Stan
 # ============================================================================
 # CONFIGURATION: Modify these bools to swap models and safety behavior
 # ============================================================================
-USE_LCM = False          # True = LCM (4-step), False = SD-Turbo (1-step)
+USE_LCM = True           # True = LCM (4-step), False = SD-Turbo (1-step)
 ENABLE_NSFW = False      # True = allow NSFW, False = block NSFW (safety ON)
 # ============================================================================
 
@@ -80,6 +80,12 @@ os.makedirs(OUT_DIR, exist_ok=True)
 GEN_LOCK = threading.Lock()   # single-flight: one generation at a time
 _pipe = None
 _pipe_lock = threading.Lock()
+_img2img_pipe = None
+_img2img_lock = threading.Lock()
+
+# img2img default: how much the input image is changed.
+# 0.1 = barely touched, 1.0 = almost ignored. 0.6 is a balanced edit.
+IMG2IMG_STRENGTH = float(os.getenv("IMG2IMG_STRENGTH", "0.6"))
 
 
 def utc_now_iso():
@@ -104,7 +110,39 @@ def _load_pipe():
         return _pipe
 
 
-def reap_old(_now=None):
+def _load_img2img_pipe():
+    """Build an img2img pipeline from the already-loaded model.
+    Reuses the same weights — no extra download, minimal extra RAM."""
+    global _img2img_pipe
+    with _img2img_lock:
+        if _img2img_pipe is not None:
+            return _img2img_pipe
+        base = _load_pipe()  # ensure the base model is loaded first
+        from diffusers import AutoPipelineForImage2Image
+        logger.info("Building img2img pipeline from loaded model (no extra download)...")
+        p = AutoPipelineForImage2Image.from_pipe(base)
+        p.set_progress_bar_config(disable=True)
+        _img2img_pipe = p
+        logger.info("img2img pipeline ready")
+        return _img2img_pipe
+
+
+def _r8(x):
+    """Round to nearest multiple of 8 (VAE requires it), min 8."""
+    return max(8, int(round(x / 8)) * 8)
+
+
+def fit_dims(w, h, cap=512):
+    """Match input aspect ratio, cap the long side at `cap`, snap to /8.
+    Keeps total pixels sane so CPU time doesn't blow up on tall/wide inputs."""
+    if w >= h:
+        out_w, out_h = cap, cap * h / w
+    else:
+        out_w, out_h = cap * w / h, cap
+    return _r8(out_w), _r8(out_h)
+
+
+
     now = _now or time.time()
     for f in glob.glob(os.path.join(OUT_DIR, "*.png")):
         try:
@@ -150,6 +188,42 @@ def generate(prompt):
     if nsfw:
         raise ValueError("blocked_nsfw")
     
+    image_id = f"img_{uuid.uuid4().hex[:10]}"
+    path = os.path.join(OUT_DIR, image_id + ".png")
+    img.save(path)
+    return image_id, path
+
+
+def generate_img2img(prompt, image_bytes, strength=None):
+    """Transform an input image with a prompt. Output matches input aspect ratio.
+    Returns (image_id, path) or raises. Safety conditional on ENABLE_NSFW."""
+    if strength is None:
+        strength = IMG2IMG_STRENGTH
+    strength = min(max(float(strength), 0.1), 1.0)
+    pipe = _load_img2img_pipe()
+    import torch
+    from PIL import Image
+    reap_old()
+    init = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    ow, oh = init.size
+    w, h = fit_dims(ow, oh)
+    init = init.resize((w, h), Image.LANCZOS)
+    with GEN_LOCK:
+        t0 = time.time()
+        kwargs = dict(prompt=prompt, image=init, num_inference_steps=STEPS,
+                      guidance_scale=GUIDANCE, strength=strength)
+        with torch.no_grad():
+            result = pipe(**kwargs)
+        img = result.images[0]
+        nsfw = False
+        if not ENABLE_NSFW:
+            flags = getattr(result, "nsfw_content_detected", None)
+            if flags and any(flags):
+                nsfw = True
+        logger.info("img2img in %.1fs (%dx%d from %dx%d, strength=%.2f, nsfw=%s)",
+                    time.time() - t0, w, h, ow, oh, strength, nsfw)
+    if nsfw:
+        raise ValueError("blocked_nsfw")
     image_id = f"img_{uuid.uuid4().hex[:10]}"
     path = os.path.join(OUT_DIR, image_id + ".png")
     img.save(path)
@@ -254,6 +328,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_POST(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        if parsed.path != "/edit":
+            self.send_error(404); return
+        q = parse_qs(parsed.query)
+        prompt = (q.get("prompt", [""])[0]).strip()
+        strength_raw = q.get("strength", [None])[0]
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            self.send_error(400, "no image body"); return
+        if not prompt:
+            self.send_error(400, "missing prompt"); return
+        body = self.rfile.read(length)
+        try:
+            image_id, path = generate_img2img(prompt, body, strength_raw)
+        except ValueError as ve:
+            if str(ve) == "blocked_nsfw":
+                self.send_error(403, "blocked by safety filter"); return
+            self.send_error(400, str(ve)); return
+        except Exception as e:
+            logger.exception("img2img failed: %s", e)
+            self.send_error(500, "generation failed"); return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(500); return
+        url = f"http://{HOST_ADDR}:{HTTP_PORT}/img/{image_id}.png"
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Image-Url", url)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+        logger.info("Served img2img %s -> %s", image_id, url)
 
 
 def serve_http():
