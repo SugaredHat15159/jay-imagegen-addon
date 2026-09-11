@@ -3,7 +3,11 @@
   "name": "imagegen",
   "display_name": "Image Generation (sd-turbo, CPU)",
   "version": "1.0.0",
+<<<<<<< HEAD
   "author": "Alex Stan",
+=======
+  "author": "SugaredHat15159",
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233
   "description": "Generate images from a spoken prompt on the server (CPU sd-turbo), then open the result on a chosen PC. Safety filter always on.",
   "skill_topic": "imagegen",
   "service": {
@@ -34,10 +38,14 @@
         "\\b(?:generate|make|create|render)\\s+(?:me\\s+)?(?:an?\\s+)?(?:image|picture|photo|drawing|painting)\\s+of\\s+(?P<subject>.+?)(?:\\s+on\\s+(?P<machine>desktop|laptop))?$",
         "\\b(?:draw|paint|sketch)\\s+(?!me\\s+a\\s+bath\\b)(?:me\\s+)?(?:a\\s+picture\\s+of\\s+|an?\\s+)?(?!the\\s+(?:curtains?|blinds?|shades?|drapes?)\\b)(?P<subject>.+?)(?:\\s+on\\s+(?P<machine>desktop|laptop))?$"
       ],
+<<<<<<< HEAD
       "data_from_groups": [
         "subject",
         "machine"
       ]
+=======
+      "data_from_groups": ["subject", "machine"]
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233
     }
   ],
   "voice_examples": [
@@ -46,4 +54,8 @@
     "draw a dog",
     "generate an image of a mountain lake on desktop"
   ]
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233

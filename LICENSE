@@ -1,20 +1,35 @@
 JAY Personal-Use License (v1.0)
 
+<<<<<<< HEAD
 Copyright (c) 2026 Alex Stan. All rights reserved.
 
 This software and associated documentation files (the "Software") were created
 by Alex Stan. Permission is hereby granted, free of charge, to any person
+=======
+Copyright (c) 2026 SugaredHat15159. All rights reserved.
+
+This software and associated documentation files (the "Software") were created
+by SugaredHat15159. Permission is hereby granted, free of charge, to any person
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233
 obtaining a copy of the Software to use, copy, modify, merge, publish, and
 distribute the Software, subject to the following conditions:
 
 1. ATTRIBUTION. The above copyright notice, this permission notice, and clear
+<<<<<<< HEAD
    credit to the original author (Alex Stan) must be included in all copies or
+=======
+   credit to the original author (SugaredHat15159) must be included in all copies or
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233
    substantial portions of the Software, and must remain visible in any
    derivative work, distribution, or public deployment.
 
 2. NON-COMMERCIAL. The Software, in whole or in part, may not be used for
    commercial purposes — including sale, paid services, or incorporation into a
+<<<<<<< HEAD
    commercial product — without the prior written permission of Alex Stan.
+=======
+   commercial product — without the prior written permission of SugaredHat15159.
+>>>>>>> 2099936b81d55d1823b9df4632cd45973cb3a233
    Personal, educational, and non-commercial use is expressly permitted.
 
 3. To request commercial-use permission, contact the author (GitHub: SugaredHat15159).
