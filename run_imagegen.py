@@ -49,14 +49,18 @@ logger = logging.getLogger("imagegen-addon")
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
-# Model selection based on USE_LCM flag
+# Model selection based on USE_LCM flag.
+# GUIDANCE differs per model: SD-Turbo needs 0.0, LCM needs ~1.0.
 if USE_LCM:
-    MODEL_ID = os.getenv("IMAGE_MODEL", "latent-consistency/lcm-lsm8-mpo-sd1.5")
-    DEFAULT_STEPS = 4
+    # Fused SD1.5 + LCM-LoRA model — loads with a plain pipeline, no LoRA/scheduler setup.
+    MODEL_ID = os.getenv("IMAGE_MODEL", "qiacheng/stable-diffusion-v1-5-lcm")
+    DEFAULT_STEPS = 6
+    GUIDANCE = 1.0
     MODEL_NAME = "LCM"
 else:
     MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
     DEFAULT_STEPS = 1
+    GUIDANCE = 0.0
     MODEL_NAME = "SD-Turbo"
 
 STEPS = int(os.getenv("IMAGE_STEPS", str(DEFAULT_STEPS)))
@@ -128,7 +132,7 @@ def generate(prompt):
     with GEN_LOCK:
         t0 = time.time()
         kwargs = dict(prompt=prompt, num_inference_steps=STEPS,
-                      guidance_scale=0.0, height=SIZE, width=SIZE)
+                      guidance_scale=GUIDANCE, height=SIZE, width=SIZE)
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
