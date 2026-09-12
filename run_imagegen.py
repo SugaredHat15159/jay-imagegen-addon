@@ -24,6 +24,7 @@ Author: Alex Stan
 """
 import os
 import io
+import re
 import json
 import time
 import uuid
@@ -279,13 +280,20 @@ def generate_img2img(prompt, image_bytes, strength=None, steps=None):
     st = CFG["strength"] if strength is None else float(strength)
     st = min(max(st, 0.1), 1.0)
     n_steps = int(steps) if steps else cur_steps()
+    # "keep aspect ratio" / full-res request: lift the long-side cap 512 -> 768.
+    # (ratio is always matched; this raises resolution. Higher than 768 breaks CPU.)
+    _kw = r"\b(keep aspect ratio|full res(?:olution)?|exact size|hi(?:gh)?[- ]?res)\b"
+    keep = bool(re.search(_kw, prompt, re.I))
+    cleaned = re.sub(_kw, "", prompt, flags=re.I).strip(" ,.")
+    prompt = cleaned or prompt
+    cap = 768 if keep else 512
     pipe = _load_img2img_pipe()
     import torch
     from PIL import Image
     reap_old()
     init = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     ow, oh = init.size
-    w, h = fit_dims(ow, oh)
+    w, h = fit_dims(ow, oh, cap)
     init = init.resize((w, h), Image.LANCZOS)
     with GEN_LOCK:
         t0 = time.time()
