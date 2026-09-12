@@ -379,7 +379,14 @@ def handle_request(req):
     data = req.get("data") or {}
     if not prompt and data.get("subject"):
         prompt = data["subject"].strip()
-    machine = (req.get("machine") or data.get("machine") or DEFAULT_PC).strip() or DEFAULT_PC
+    machine = (req.get("machine") or data.get("machine") or "").strip()
+    # A trailing "on laptop/desktop" is the target machine, not part of the image.
+    _mt = re.search(r"\s+on\s+(desktop|laptop)\s*$", prompt, re.I)
+    if _mt:
+        if not machine:
+            machine = _mt.group(1).lower()
+        prompt = prompt[:_mt.start()].strip()
+    machine = machine or DEFAULT_PC
     source = req.get("source")
     if not prompt:
         publish_tts("What should I generate an image of?", source)
