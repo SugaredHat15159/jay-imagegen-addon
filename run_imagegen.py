@@ -1,29 +1,27 @@
-"""JAY Image Generation Addon — CPU sd-turbo / LCM text-to-image.
+"""JAY Image Generation Addon — CPU text-to-image / image-to-image.
 
 Generates on the server (thread-capped, single-flight), serves the PNG on a
 dedicated HTTP port, tells a PC to open the URL, and auto-deletes the file
 after a TTL so storage never grows.
 
-Supports two models:
-  - SD-Turbo (1 step, fast, lower quality, CPU-safe)
-  - LCM (4 steps, medium quality, CPU-safe)
+Runtime-configurable (no rebuild): the active model, NSFW/safety, default
+steps and img2img strength can all be changed live via the /config endpoint.
+Model + NSFW changes reload the pipeline in-place; steps + strength apply per
+request. Guidance is bound to each model preset automatically. Config is
+persisted to the data volume so restarts keep your last choice.
 
-Safety filter is configurable via ENABLE_NSFW bool.
-
-This is a JAY addon. It plugs into JAY purely over MQTT:
-  subscribes: skill/imagegen/request
+MQTT contract:
+  subscribes: skill/imagegen/request, skill/imagegen/config/set
   publishes:  tts/request, skill/imagegen/state, pc/command/<machine>
+
+HTTP:
+  GET  /img/<id>.png   serve a generated image
+  GET  /config         current config + available models
+  POST /config         update config (JSON body)
+  POST /edit           img2img: raw image body, ?prompt=&strength=&steps=
 
 Author: Alex Stan
 """
-
-# ============================================================================
-# CONFIGURATION: Modify these bools to swap models and safety behavior
-# ============================================================================
-USE_LCM = True           # True = LCM (4-step), False = SD-Turbo (1-step)
-ENABLE_NSFW = False      # True = allow NSFW, False = block NSFW (safety ON)
-# ============================================================================
-
 import os
 import io
 import json
@@ -49,21 +47,22 @@ logger = logging.getLogger("imagegen-addon")
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
-# Model selection based on USE_LCM flag.
-# GUIDANCE differs per model: SD-Turbo needs 0.0, LCM needs ~1.0.
-if USE_LCM:
-    # Fused SD1.5 + LCM-LoRA model — loads with a plain pipeline, no LoRA/scheduler setup.
-    MODEL_ID = os.getenv("IMAGE_MODEL", "qiacheng/stable-diffusion-v1-5-lcm")
-    DEFAULT_STEPS = 6
-    GUIDANCE = 1.0
-    MODEL_NAME = "LCM"
-else:
-    MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
-    DEFAULT_STEPS = 1
-    GUIDANCE = 0.0
-    MODEL_NAME = "SD-Turbo"
+# ============================================================================
+# MODEL PRESETS — each carries its own guidance + default steps so the UI
+# never has to expose guidance. Add a line here to offer another model.
+# ============================================================================
+MODELS = {
+    "dreamshaper": {"label": "DreamShaper v7 (LCM)",
+                    "id": "SimianLuo/LCM_Dreamshaper_v7", "guidance": 8.0, "steps": 6},
+    "sd15-lcm":    {"label": "SD 1.5 (LCM)",
+                    "id": "qiacheng/stable-diffusion-v1-5-lcm", "guidance": 1.0, "steps": 6},
+    "sd-turbo":    {"label": "SD-Turbo (fastest)",
+                    "id": "stabilityai/sd-turbo", "guidance": 0.0, "steps": 1},
+}
+DEFAULT_MODEL_KEY = os.getenv("IMAGE_MODEL_KEY", "dreamshaper")
+if DEFAULT_MODEL_KEY not in MODELS:
+    DEFAULT_MODEL_KEY = "dreamshaper"
 
-STEPS = int(os.getenv("IMAGE_STEPS", str(DEFAULT_STEPS)))
 SIZE = int(os.getenv("IMAGE_SIZE", "512"))
 ALLOWED_SIZES = {512, 768}
 HTTP_PORT = int(os.getenv("IMAGE_HTTP_PORT", "8137"))
@@ -71,21 +70,68 @@ HOST_ADDR = os.getenv("IMAGE_HOST_ADDR", "100.119.255.57")  # tailnet IP for ser
 TTL_SECONDS = int(os.getenv("IMAGE_TTL_SECONDS", "600"))    # delete PNGs after 10 min
 OUT_DIR = os.getenv("IMAGE_OUT_DIR", "/app/data/out")
 DEFAULT_PC = os.getenv("DEFAULT_PC", "laptop")
-
-# Skill topic this addon answers on. Matches skill_topic in addon.manifest.json.
 SKILL = os.getenv("IMAGE_SKILL_TOPIC", "imagegen")
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================================
+# RUNTIME CONFIG — mutable, persisted to the data volume.
+# ============================================================================
+CONFIG_PATH = os.path.join(os.path.dirname(OUT_DIR.rstrip("/")) or "/app/data", "config.json")
+CFG_LOCK = threading.Lock()
+CFG = {
+    "model_key": DEFAULT_MODEL_KEY,
+    "nsfw": os.getenv("ENABLE_NSFW", "false").lower() in ("1", "true", "yes"),
+    "steps": None,   # None = use the active model's default
+    "strength": float(os.getenv("IMG2IMG_STRENGTH", "0.6")),
+}
+
+
+def load_config():
+    """Load persisted config over the defaults, if present and valid."""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+        for k in CFG:
+            if k in saved:
+                CFG[k] = saved[k]
+        if CFG["model_key"] not in MODELS:
+            CFG["model_key"] = DEFAULT_MODEL_KEY
+        logger.info("Loaded persisted config: %s", CFG)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("config load failed (%s), using defaults", e)
+
+
+def save_config():
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(CFG, f)
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        logger.warning("config save failed: %s", e)
+
+
+def cur_model():
+    return MODELS.get(CFG["model_key"], MODELS[DEFAULT_MODEL_KEY])
+
+
+def cur_steps():
+    return int(CFG["steps"]) if CFG["steps"] else int(cur_model()["steps"])
+
+
+def cur_guidance():
+    return float(cur_model()["guidance"])
+
 
 GEN_LOCK = threading.Lock()   # single-flight: one generation at a time
 _pipe = None
 _pipe_lock = threading.Lock()
 _img2img_pipe = None
 _img2img_lock = threading.Lock()
-
-# img2img default: how much the input image is changed.
-# 0.1 = barely touched, 1.0 = almost ignored. 0.6 is a balanced edit.
-IMG2IMG_STRENGTH = float(os.getenv("IMG2IMG_STRENGTH", "0.6"))
+READY = threading.Event()
 
 
 def utc_now_iso():
@@ -93,7 +139,7 @@ def utc_now_iso():
 
 
 def _load_pipe():
-    """Load model once, keep resident. Heavy import kept lazy."""
+    """Load the active model once, keep resident. Heavy import kept lazy."""
     global _pipe
     with _pipe_lock:
         if _pipe is not None:
@@ -101,16 +147,22 @@ def _load_pipe():
         import torch
         torch.set_num_threads(IMAGE_THREADS)
         from diffusers import AutoPipelineForText2Image
-        logger.info("Loading %s (model=%s, threads=%d)...", MODEL_NAME, MODEL_ID, IMAGE_THREADS)
+        m = cur_model()
+        nsfw = bool(CFG["nsfw"])
+        logger.info("Loading %s (model=%s, nsfw=%s, threads=%d)...",
+                    m["label"], m["id"], nsfw, IMAGE_THREADS)
         t0 = time.time()
         load_kw = dict(torch_dtype=torch.float32)
-        if ENABLE_NSFW:
+        if nsfw:
+            # Turn OFF the model's built-in checker so images aren't blacked out.
             load_kw["safety_checker"] = None
             load_kw["requires_safety_checker"] = False
-        p = AutoPipelineForText2Image.from_pretrained(MODEL_ID, **load_kw)
+        p = AutoPipelineForText2Image.from_pretrained(m["id"], **load_kw)
         p.set_progress_bar_config(disable=True)
         _pipe = p
-        logger.info("Model ready in %.1fs", time.time() - t0)
+        READY.set()
+        logger.info("Model ready in %.1fs (safety_checker=%s)",
+                    time.time() - t0, "off" if nsfw else "on")
         return _pipe
 
 
@@ -129,6 +181,29 @@ def _load_img2img_pipe():
         _img2img_pipe = p
         logger.info("img2img pipeline ready")
         return _img2img_pipe
+
+
+def reset_pipes():
+    """Drop the resident pipelines so the next load picks up new config."""
+    global _pipe, _img2img_pipe
+    with _pipe_lock:
+        _pipe = None
+    with _img2img_lock:
+        _img2img_pipe = None
+    READY.clear()
+
+
+def reload_async():
+    """Reload the pipeline in the background after a model/nsfw change."""
+    def _run():
+        try:
+            reset_pipes()
+            _load_pipe()
+            publish_state("ready")
+        except Exception as e:
+            logger.exception("reload failed: %s", e)
+            publish_state("error", error=str(e))
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _r8(x):
@@ -166,44 +241,44 @@ def reaper_loop():
             logger.warning("reaper: %s", e)
 
 
-def generate(prompt):
-    """Return (image_id, path) or raise. Safety is conditional on ENABLE_NSFW."""
+def _flagged_nsfw(result):
+    """True only when the pipeline's checker flagged the image AND safety is on."""
+    if CFG["nsfw"]:
+        return False
+    flags = getattr(result, "nsfw_content_detected", None)
+    return bool(flags and any(flags))
+
+
+def generate(prompt, steps=None):
+    """Text-to-image. Returns (image_id, path) or raises."""
     pipe = _load_pipe()
     import torch
-    reap_old()  # prune before each gen so nothing piles up
+    reap_old()
+    n_steps = int(steps) if steps else cur_steps()
     with GEN_LOCK:
         t0 = time.time()
-        kwargs = dict(prompt=prompt, num_inference_steps=STEPS,
-                      guidance_scale=GUIDANCE, height=SIZE, width=SIZE)
+        kwargs = dict(prompt=prompt, num_inference_steps=n_steps,
+                      guidance_scale=cur_guidance(), height=SIZE, width=SIZE)
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
-        
-        # Safety check: only enforce if ENABLE_NSFW is False
-        nsfw = False
-        if not ENABLE_NSFW:
-            flags = getattr(result, "nsfw_content_detected", None)
-            if flags and any(flags):
-                nsfw = True
-        
-        logger.info("Generated in %.1fs (nsfw=%s, safety=%s)", 
-                    time.time() - t0, nsfw, "ON" if not ENABLE_NSFW else "OFF")
-    
+        nsfw = _flagged_nsfw(result)
+        logger.info("Generated in %.1fs (steps=%d, nsfw=%s, safety=%s)",
+                    time.time() - t0, n_steps, nsfw, "ON" if not CFG["nsfw"] else "OFF")
     if nsfw:
         raise ValueError("blocked_nsfw")
-    
     image_id = f"img_{uuid.uuid4().hex[:10]}"
     path = os.path.join(OUT_DIR, image_id + ".png")
     img.save(path)
     return image_id, path
 
 
-def generate_img2img(prompt, image_bytes, strength=None):
-    """Transform an input image with a prompt. Output matches input aspect ratio.
-    Returns (image_id, path) or raises. Safety conditional on ENABLE_NSFW."""
-    if strength is None:
-        strength = IMG2IMG_STRENGTH
-    strength = min(max(float(strength), 0.1), 1.0)
+def generate_img2img(prompt, image_bytes, strength=None, steps=None):
+    """Image-to-image. Output matches input aspect ratio.
+    Returns (image_id, path) or raises."""
+    st = CFG["strength"] if strength is None else float(strength)
+    st = min(max(st, 0.1), 1.0)
+    n_steps = int(steps) if steps else cur_steps()
     pipe = _load_img2img_pipe()
     import torch
     from PIL import Image
@@ -214,18 +289,14 @@ def generate_img2img(prompt, image_bytes, strength=None):
     init = init.resize((w, h), Image.LANCZOS)
     with GEN_LOCK:
         t0 = time.time()
-        kwargs = dict(prompt=prompt, image=init, num_inference_steps=STEPS,
-                      guidance_scale=GUIDANCE, strength=strength)
+        kwargs = dict(prompt=prompt, image=init, num_inference_steps=n_steps,
+                      guidance_scale=cur_guidance(), strength=st)
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
-        nsfw = False
-        if not ENABLE_NSFW:
-            flags = getattr(result, "nsfw_content_detected", None)
-            if flags and any(flags):
-                nsfw = True
-        logger.info("img2img in %.1fs (%dx%d from %dx%d, strength=%.2f, nsfw=%s)",
-                    time.time() - t0, w, h, ow, oh, strength, nsfw)
+        nsfw = _flagged_nsfw(result)
+        logger.info("img2img in %.1fs (%dx%d from %dx%d, steps=%d, strength=%.2f, nsfw=%s)",
+                    time.time() - t0, w, h, ow, oh, n_steps, st, nsfw)
     if nsfw:
         raise ValueError("blocked_nsfw")
     image_id = f"img_{uuid.uuid4().hex[:10]}"
@@ -244,23 +315,59 @@ def publish_tts(text, source=None):
     client.publish("tts/request", json.dumps(payload), qos=1)
 
 
-def publish_state(status, **extra):
-    payload = {
-        "skill": SKILL,
-        "timestamp": utc_now_iso(),
-        "status": status,
-        "model": MODEL_NAME,
-        "safety": not ENABLE_NSFW,  # True = safety ON, False = safety OFF
-        "size": SIZE,
-        "steps": STEPS
+def config_snapshot():
+    """Current effective config + model catalog, for the UI."""
+    m = cur_model()
+    return {
+        "models": [{"key": k, "label": v["label"]} for k, v in MODELS.items()],
+        "model_key": CFG["model_key"],
+        "model_label": m["label"],
+        "nsfw": bool(CFG["nsfw"]),
+        "steps": cur_steps(),
+        "strength": round(float(CFG["strength"]), 2),
+        "ready": READY.is_set(),
     }
+
+
+def publish_state(status, **extra):
+    payload = {"skill": SKILL, "timestamp": utc_now_iso(), "status": status, "size": SIZE}
+    payload.update(config_snapshot())
+    payload["safety"] = not CFG["nsfw"]  # back-compat field
     payload.update(extra)
     client.publish(f"skill/{SKILL}/state", json.dumps(payload), qos=1, retain=True)
 
 
+def apply_config(patch):
+    """Apply a partial config update. Returns (snapshot, reloaded_bool)."""
+    reload_needed = False
+    with CFG_LOCK:
+        if "model_key" in patch and patch["model_key"] in MODELS \
+                and patch["model_key"] != CFG["model_key"]:
+            CFG["model_key"] = patch["model_key"]
+            reload_needed = True
+        if "nsfw" in patch:
+            nv = bool(patch["nsfw"])
+            if nv != CFG["nsfw"]:
+                CFG["nsfw"] = nv
+                reload_needed = True
+        if "steps" in patch and patch["steps"] is not None:
+            try:
+                CFG["steps"] = max(1, min(12, int(patch["steps"])))
+            except (TypeError, ValueError):
+                pass
+        if "strength" in patch and patch["strength"] is not None:
+            try:
+                CFG["strength"] = max(0.1, min(1.0, float(patch["strength"])))
+            except (TypeError, ValueError):
+                pass
+        save_config()
+    if reload_needed:
+        reload_async()
+    return config_snapshot(), reload_needed
+
+
 def handle_request(req):
     prompt = (req.get("prompt") or req.get("text") or "").strip()
-    # An addon-matched request carries data from the manifest's named groups.
     data = req.get("data") or {}
     if not prompt and data.get("subject"):
         prompt = data["subject"].strip()
@@ -295,8 +402,9 @@ def handle_request(req):
 def on_connect(client, userdata, flags, reason_code, properties):
     logger.info("Connected to MQTT %s:%s", MQTT_HOST, MQTT_PORT)
     client.subscribe(f"skill/{SKILL}/request", qos=1)
-    logger.info("Subscribed to skill/%s/request", SKILL)
-    publish_state("ready")
+    client.subscribe(f"skill/{SKILL}/config/set", qos=1)
+    logger.info("Subscribed to skill/%s/request and /config/set", SKILL)
+    publish_state("ready" if READY.is_set() else "loading")
 
 
 def on_message(client, userdata, msg):
@@ -304,6 +412,9 @@ def on_message(client, userdata, msg):
         if msg.topic == f"skill/{SKILL}/request":
             req = json.loads(msg.payload.decode() or "{}")
             threading.Thread(target=handle_request, args=(req,), daemon=True).start()
+        elif msg.topic == f"skill/{SKILL}/config/set":
+            patch = json.loads(msg.payload.decode() or "{}")
+            apply_config(patch)
     except Exception as e:
         logger.exception("on_message: %s", e)
 
@@ -312,17 +423,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if not self.path.startswith("/img/"):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        if path == "/config":
+            self._json(config_snapshot()); return
+        if not path.startswith("/img/"):
             self.send_error(404); return
-        name = os.path.basename(self.path[len("/img/"):])
+        name = os.path.basename(path[len("/img/"):])
         if not name.endswith(".png") or "/" in name or "\\" in name:
             self.send_error(400); return
-        path = os.path.join(OUT_DIR, name)
-        if not os.path.exists(path):
+        fpath = os.path.join(OUT_DIR, name)
+        if not os.path.exists(fpath):
             self.send_error(404, "expired or unknown"); return
         try:
-            with open(path, "rb") as f:
+            with open(fpath, "rb") as f:
                 data = f.read()
         except OSError:
             self.send_error(404); return
@@ -336,19 +460,61 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length > 0 else b""
+
+        if parsed.path == "/config":
+            try:
+                patch = json.loads(body.decode() or "{}")
+            except Exception:
+                self._json({"ok": False, "error": "bad json"}, 400); return
+            snap, reloaded = apply_config(patch)
+            snap["ok"] = True
+            snap["reloading"] = reloaded
+            self._json(snap); return
+
+        if parsed.path == "/generate":
+            q = parse_qs(parsed.query)
+            prompt = (q.get("prompt", [""])[0]).strip()
+            steps_raw = q.get("steps", [None])[0]
+            if not prompt:
+                self.send_error(400, "missing prompt"); return
+            try:
+                image_id, path = generate(prompt, steps_raw)
+            except ValueError as ve:
+                if str(ve) == "blocked_nsfw":
+                    self.send_error(403, "blocked by safety filter"); return
+                self.send_error(400, str(ve)); return
+            except Exception as e:
+                logger.exception("generate failed: %s", e)
+                self.send_error(500, "generation failed"); return
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self.send_error(500); return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            logger.info("Served text2img %s", image_id)
+            return
+
         if parsed.path != "/edit":
             self.send_error(404); return
+
         q = parse_qs(parsed.query)
         prompt = (q.get("prompt", [""])[0]).strip()
         strength_raw = q.get("strength", [None])[0]
-        length = int(self.headers.get("Content-Length", "0"))
+        steps_raw = q.get("steps", [None])[0]
         if length <= 0:
             self.send_error(400, "no image body"); return
         if not prompt:
             self.send_error(400, "missing prompt"); return
-        body = self.rfile.read(length)
         try:
-            image_id, path = generate_img2img(prompt, body, strength_raw)
+            image_id, path = generate_img2img(prompt, body, strength_raw, steps_raw)
         except ValueError as ve:
             if str(ve) == "blocked_nsfw":
                 self.send_error(403, "blocked by safety filter"); return
@@ -379,9 +545,12 @@ def serve_http():
 
 
 if __name__ == "__main__":
+    load_config()
+    m = cur_model()
     logger.info("JAY Image Generation Addon starting "
-                "(model=%s, steps=%d, size=%d, threads=%d, safety=%s)",
-                MODEL_NAME, STEPS, SIZE, IMAGE_THREADS, "ON" if not ENABLE_NSFW else "OFF")
+                "(model=%s, steps=%d, strength=%.2f, size=%d, threads=%d, safety=%s)",
+                m["label"], cur_steps(), CFG["strength"], SIZE, IMAGE_THREADS,
+                "ON" if not CFG["nsfw"] else "OFF")
     threading.Thread(target=serve_http, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
     threading.Thread(target=_load_pipe, daemon=True).start()
