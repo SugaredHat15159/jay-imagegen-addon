@@ -1,31 +1,30 @@
-"""JAY Image Generation Addon — CPU sd-turbo / LCM text-to-image.
+"""JAY Image Generation Addon — CPU text-to-image / image-to-image.
 
 Generates on the server (thread-capped, single-flight), serves the PNG on a
 dedicated HTTP port, tells a PC to open the URL, and auto-deletes the file
 after a TTL so storage never grows.
 
-Supports two models:
-  - SD-Turbo (1 step, fast, lower quality, CPU-safe)
-  - LCM (4 steps, medium quality, CPU-safe)
+Runtime-configurable (no rebuild): the active model, NSFW/safety, default
+steps and img2img strength can all be changed live via the /config endpoint.
+Model + NSFW changes reload the pipeline in-place; steps + strength apply per
+request. Guidance is bound to each model preset automatically. Config is
+persisted to the data volume so restarts keep your last choice.
 
-Safety filter is configurable via ENABLE_NSFW bool.
-
-This is a JAY addon. It plugs into JAY purely over MQTT:
-  subscribes: skill/imagegen/request
+MQTT contract:
+  subscribes: skill/imagegen/request, skill/imagegen/config/set
   publishes:  tts/request, skill/imagegen/state, pc/command/<machine>
+
+HTTP:
+  GET  /img/<id>.png   serve a generated image
+  GET  /config         current config + available models
+  POST /config         update config (JSON body)
+  POST /edit           img2img: raw image body, ?prompt=&strength=&steps=
 
 Author: Alex Stan
 """
-
-# ============================================================================
-# CONFIGURATION: Modify these bools to swap models and safety behavior
-# ============================================================================
-USE_LCM = False          # True = LCM (4-step), False = SD-Turbo (1-step)
-ENABLE_NSFW = False      # True = allow NSFW, False = block NSFW (safety ON)
-# ============================================================================
-
 import os
 import io
+import re
 import json
 import time
 import uuid
@@ -49,21 +48,22 @@ logger = logging.getLogger("imagegen-addon")
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
-# Model selection based on USE_LCM flag.
-# GUIDANCE differs per model: SD-Turbo needs 0.0, LCM needs ~1.0.
-if USE_LCM:
-    # Fused SD1.5 + LCM-LoRA model — loads with a plain pipeline, no LoRA/scheduler setup.
-    MODEL_ID = os.getenv("IMAGE_MODEL", "qiacheng/stable-diffusion-v1-5-lcm")
-    DEFAULT_STEPS = 6
-    GUIDANCE = 1.0
-    MODEL_NAME = "LCM"
-else:
-    MODEL_ID = os.getenv("IMAGE_MODEL", "stabilityai/sd-turbo")
-    DEFAULT_STEPS = 1
-    GUIDANCE = 0.0
-    MODEL_NAME = "SD-Turbo"
+# ============================================================================
+# MODEL PRESETS — each carries its own guidance + default steps so the UI
+# never has to expose guidance. Add a line here to offer another model.
+# ============================================================================
+MODELS = {
+    "dreamshaper": {"label": "DreamShaper v7 (LCM)",
+                    "id": "SimianLuo/LCM_Dreamshaper_v7", "guidance": 8.0, "steps": 6},
+    "sd15-lcm":    {"label": "SD 1.5 (LCM)",
+                    "id": "qiacheng/stable-diffusion-v1-5-lcm", "guidance": 1.0, "steps": 6},
+    "sd-turbo":    {"label": "SD-Turbo (fastest)",
+                    "id": "stabilityai/sd-turbo", "guidance": 0.0, "steps": 1},
+}
+DEFAULT_MODEL_KEY = os.getenv("IMAGE_MODEL_KEY", "dreamshaper")
+if DEFAULT_MODEL_KEY not in MODELS:
+    DEFAULT_MODEL_KEY = "dreamshaper"
 
-STEPS = int(os.getenv("IMAGE_STEPS", str(DEFAULT_STEPS)))
 SIZE = int(os.getenv("IMAGE_SIZE", "512"))
 ALLOWED_SIZES = {512, 768}
 HTTP_PORT = int(os.getenv("IMAGE_HTTP_PORT", "8137"))
@@ -71,15 +71,79 @@ HOST_ADDR = os.getenv("IMAGE_HOST_ADDR", "100.119.255.57")  # tailnet IP for ser
 TTL_SECONDS = int(os.getenv("IMAGE_TTL_SECONDS", "600"))    # delete PNGs after 10 min
 OUT_DIR = os.getenv("IMAGE_OUT_DIR", "/app/data/out")
 DEFAULT_PC = os.getenv("DEFAULT_PC", "laptop")
-
-# Skill topic this addon answers on. Matches skill_topic in addon.manifest.json.
 SKILL = os.getenv("IMAGE_SKILL_TOPIC", "imagegen")
 
+# Outpainting / inpainting uses a dedicated inpaint checkpoint (standard SD1.5,
+# not LCM) so it needs more steps + normal guidance than the LCM gen models.
+INPAINT_MODEL_ID = os.getenv("IMAGE_INPAINT_MODEL", "stable-diffusion-v1-5/stable-diffusion-inpainting")
+INPAINT_STEPS = int(os.getenv("INPAINT_STEPS", "24"))
+INPAINT_GUIDANCE = float(os.getenv("INPAINT_GUIDANCE", "7.5"))
+OUTPAINT_CAP = int(os.getenv("OUTPAINT_CAP", "768"))   # max long side of the extended canvas
+
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================================
+# RUNTIME CONFIG — mutable, persisted to the data volume.
+# ============================================================================
+CONFIG_PATH = os.path.join(os.path.dirname(OUT_DIR.rstrip("/")) or "/app/data", "config.json")
+CFG_LOCK = threading.Lock()
+CFG = {
+    "model_key": DEFAULT_MODEL_KEY,
+    "nsfw": os.getenv("ENABLE_NSFW", "false").lower() in ("1", "true", "yes"),
+    "steps": None,   # None = use the active model's default
+    "strength": float(os.getenv("IMG2IMG_STRENGTH", "0.6")),
+    "outpaint_steps": INPAINT_STEPS,
+    "outpaint_amount": float(os.getenv("OUTPAINT_AMOUNT", "0.4")),
+}
+
+
+def load_config():
+    """Load persisted config over the defaults, if present and valid."""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+        for k in CFG:
+            if k in saved:
+                CFG[k] = saved[k]
+        if CFG["model_key"] not in MODELS:
+            CFG["model_key"] = DEFAULT_MODEL_KEY
+        logger.info("Loaded persisted config: %s", CFG)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("config load failed (%s), using defaults", e)
+
+
+def save_config():
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(CFG, f)
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        logger.warning("config save failed: %s", e)
+
+
+def cur_model():
+    return MODELS.get(CFG["model_key"], MODELS[DEFAULT_MODEL_KEY])
+
+
+def cur_steps():
+    return int(CFG["steps"]) if CFG["steps"] else int(cur_model()["steps"])
+
+
+def cur_guidance():
+    return float(cur_model()["guidance"])
+
 
 GEN_LOCK = threading.Lock()   # single-flight: one generation at a time
 _pipe = None
 _pipe_lock = threading.Lock()
+_img2img_pipe = None
+_img2img_lock = threading.Lock()
+_inpaint_pipe = None
+_inpaint_lock = threading.Lock()
+READY = threading.Event()
 
 
 def utc_now_iso():
@@ -87,7 +151,7 @@ def utc_now_iso():
 
 
 def _load_pipe():
-    """Load model once, keep resident. Heavy import kept lazy."""
+    """Load the active model once, keep resident. Heavy import kept lazy."""
     global _pipe
     with _pipe_lock:
         if _pipe is not None:
@@ -95,13 +159,78 @@ def _load_pipe():
         import torch
         torch.set_num_threads(IMAGE_THREADS)
         from diffusers import AutoPipelineForText2Image
-        logger.info("Loading %s (model=%s, threads=%d)...", MODEL_NAME, MODEL_ID, IMAGE_THREADS)
+        m = cur_model()
+        nsfw = bool(CFG["nsfw"])
+        logger.info("Loading %s (model=%s, nsfw=%s, threads=%d)...",
+                    m["label"], m["id"], nsfw, IMAGE_THREADS)
         t0 = time.time()
-        p = AutoPipelineForText2Image.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
+        load_kw = dict(torch_dtype=torch.float32)
+        if nsfw:
+            # Turn OFF the model's built-in checker so images aren't blacked out.
+            load_kw["safety_checker"] = None
+            load_kw["requires_safety_checker"] = False
+        p = AutoPipelineForText2Image.from_pretrained(m["id"], **load_kw)
         p.set_progress_bar_config(disable=True)
         _pipe = p
-        logger.info("Model ready in %.1fs", time.time() - t0)
+        READY.set()
+        logger.info("Model ready in %.1fs (safety_checker=%s)",
+                    time.time() - t0, "off" if nsfw else "on")
         return _pipe
+
+
+def _load_img2img_pipe():
+    """Build an img2img pipeline from the already-loaded model.
+    Reuses the same weights — no extra download, minimal extra RAM."""
+    global _img2img_pipe
+    with _img2img_lock:
+        if _img2img_pipe is not None:
+            return _img2img_pipe
+        base = _load_pipe()  # ensure the base model is loaded first
+        from diffusers import AutoPipelineForImage2Image
+        logger.info("Building img2img pipeline from loaded model (no extra download)...")
+        p = AutoPipelineForImage2Image.from_pipe(base)
+        p.set_progress_bar_config(disable=True)
+        _img2img_pipe = p
+        logger.info("img2img pipeline ready")
+        return _img2img_pipe
+
+
+def reset_pipes():
+    """Drop the resident pipelines so the next load picks up new config."""
+    global _pipe, _img2img_pipe
+    with _pipe_lock:
+        _pipe = None
+    with _img2img_lock:
+        _img2img_pipe = None
+    READY.clear()
+
+
+def reload_async():
+    """Reload the pipeline in the background after a model/nsfw change."""
+    def _run():
+        try:
+            reset_pipes()
+            _load_pipe()
+            publish_state("ready")
+        except Exception as e:
+            logger.exception("reload failed: %s", e)
+            publish_state("error", error=str(e))
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _r8(x):
+    """Round to nearest multiple of 8 (VAE requires it), min 8."""
+    return max(8, int(round(x / 8)) * 8)
+
+
+def fit_dims(w, h, cap=512):
+    """Match input aspect ratio, cap the long side at `cap`, snap to /8.
+    Keeps total pixels sane so CPU time doesn't blow up on tall/wide inputs."""
+    if w >= h:
+        out_w, out_h = cap, cap * h / w
+    else:
+        out_w, out_h = cap * w / h, cap
+    return _r8(out_w), _r8(out_h)
 
 
 def reap_old(_now=None):
@@ -124,35 +253,179 @@ def reaper_loop():
             logger.warning("reaper: %s", e)
 
 
-def generate(prompt):
-    """Return (image_id, path) or raise. Safety is conditional on ENABLE_NSFW."""
+def _flagged_nsfw(result):
+    """True only when the pipeline's checker flagged the image AND safety is on."""
+    if CFG["nsfw"]:
+        return False
+    flags = getattr(result, "nsfw_content_detected", None)
+    return bool(flags and any(flags))
+
+
+def generate(prompt, steps=None):
+    """Text-to-image. Returns (image_id, path) or raises."""
     pipe = _load_pipe()
     import torch
-    reap_old()  # prune before each gen so nothing piles up
+    reap_old()
+    n_steps = int(steps) if steps else cur_steps()
     with GEN_LOCK:
         t0 = time.time()
-        kwargs = dict(prompt=prompt, num_inference_steps=STEPS,
-                      guidance_scale=GUIDANCE, height=SIZE, width=SIZE)
+        kwargs = dict(prompt=prompt, num_inference_steps=n_steps,
+                      guidance_scale=cur_guidance(), height=SIZE, width=SIZE)
         with torch.no_grad():
             result = pipe(**kwargs)
         img = result.images[0]
-        
-        # Safety check: only enforce if ENABLE_NSFW is False
-        nsfw = False
-        if not ENABLE_NSFW:
-            flags = getattr(result, "nsfw_content_detected", None)
-            if flags and any(flags):
-                nsfw = True
-        
-        logger.info("Generated in %.1fs (nsfw=%s, safety=%s)", 
-                    time.time() - t0, nsfw, "ON" if not ENABLE_NSFW else "OFF")
-    
+        nsfw = _flagged_nsfw(result)
+        logger.info("Generated in %.1fs (steps=%d, nsfw=%s, safety=%s)",
+                    time.time() - t0, n_steps, nsfw, "ON" if not CFG["nsfw"] else "OFF")
     if nsfw:
         raise ValueError("blocked_nsfw")
-    
     image_id = f"img_{uuid.uuid4().hex[:10]}"
     path = os.path.join(OUT_DIR, image_id + ".png")
     img.save(path)
+    return image_id, path
+
+
+def generate_img2img(prompt, image_bytes, strength=None, steps=None):
+    """Image-to-image. Output matches input aspect ratio.
+    Returns (image_id, path) or raises."""
+    st = CFG["strength"] if strength is None else float(strength)
+    st = min(max(st, 0.1), 1.0)
+    n_steps = int(steps) if steps else cur_steps()
+    # "keep aspect ratio" / full-res request: lift the long-side cap 512 -> 768.
+    # (ratio is always matched; this raises resolution. Higher than 768 breaks CPU.)
+    _kw = r"\b(keep aspect ratio|full res(?:olution)?|exact size|hi(?:gh)?[- ]?res)\b"
+    keep = bool(re.search(_kw, prompt, re.I))
+    cleaned = re.sub(_kw, "", prompt, flags=re.I).strip(" ,.")
+    prompt = cleaned or prompt
+    cap = 768 if keep else 512
+    pipe = _load_img2img_pipe()
+    import torch
+    from PIL import Image
+    reap_old()
+    init = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    ow, oh = init.size
+    w, h = fit_dims(ow, oh, cap)
+    init = init.resize((w, h), Image.LANCZOS)
+    with GEN_LOCK:
+        t0 = time.time()
+        kwargs = dict(prompt=prompt, image=init, num_inference_steps=n_steps,
+                      guidance_scale=cur_guidance(), strength=st)
+        with torch.no_grad():
+            result = pipe(**kwargs)
+        img = result.images[0]
+        nsfw = _flagged_nsfw(result)
+        logger.info("img2img in %.1fs (%dx%d from %dx%d, steps=%d, strength=%.2f, nsfw=%s)",
+                    time.time() - t0, w, h, ow, oh, n_steps, st, nsfw)
+    if nsfw:
+        raise ValueError("blocked_nsfw")
+    image_id = f"img_{uuid.uuid4().hex[:10]}"
+    path = os.path.join(OUT_DIR, image_id + ".png")
+    img.save(path)
+    return image_id, path
+
+
+def _load_inpaint_pipe():
+    """Lazy-load the inpainting model (separate architecture from the gen models).
+    Only loaded the first time an outpaint/inpaint is requested."""
+    global _inpaint_pipe
+    with _inpaint_lock:
+        if _inpaint_pipe is not None:
+            return _inpaint_pipe
+        import torch
+        torch.set_num_threads(IMAGE_THREADS)
+        from diffusers import AutoPipelineForInpainting
+        logger.info("Loading inpaint model %s (first use; may download)...", INPAINT_MODEL_ID)
+        t0 = time.time()
+        load_kw = dict(torch_dtype=torch.float32)
+        if CFG["nsfw"]:
+            load_kw["safety_checker"] = None
+            load_kw["requires_safety_checker"] = False
+        p = AutoPipelineForInpainting.from_pretrained(INPAINT_MODEL_ID, **load_kw)
+        p.set_progress_bar_config(disable=True)
+        _inpaint_pipe = p
+        logger.info("Inpaint model ready in %.1fs", time.time() - t0)
+        return _inpaint_pipe
+
+
+def _f8(x):
+    """Floor to a multiple of 8 (never rounds up past a budget), min 8."""
+    return max(8, (int(x) // 8) * 8)
+
+
+def plan_outpaint(ow, oh, direction, amount, cap=None):
+    """Base size, per-side additions, final canvas — all /8, long side capped."""
+    cap = cap or OUTPAINT_CAP
+    amount = min(max(float(amount), 0.1), 1.0)
+    base_cap = 512
+    if ow >= oh:
+        bw = min(base_cap, _r8(ow)); bh = _r8(bw * oh / ow)
+    else:
+        bh = min(base_cap, _r8(oh)); bw = _r8(bh * ow / oh)
+    l = r = t = b = 0
+    if direction == "down":
+        b = _r8(bh * amount)
+    elif direction == "up":
+        t = _r8(bh * amount)
+    elif direction == "left":
+        l = _r8(bw * amount)
+    elif direction == "right":
+        r = _r8(bw * amount)
+    elif direction == "all":
+        l = r = _r8(bw * amount / 2); t = b = _r8(bh * amount / 2)
+    else:
+        b = _r8(bh * amount)
+    nw, nh = bw + l + r, bh + t + b
+    longest = max(nw, nh)
+    if longest > cap:
+        f = cap / longest
+        bw, bh = _f8(bw * f), _f8(bh * f)
+        l = _f8(l * f) if l else 0
+        r = _f8(r * f) if r else 0
+        t = _f8(t * f) if t else 0
+        b = _f8(b * f) if b else 0
+        nw, nh = bw + l + r, bh + t + b
+    return dict(bw=bw, bh=bh, l=l, r=r, t=t, b=b, nw=nw, nh=nh)
+
+
+def generate_outpaint(prompt, image_bytes, direction="down", amount=None, steps=None):
+    """Extend the canvas and fill the new area. Original pixels preserved exactly.
+    Returns (image_id, path) or raises."""
+    amt = CFG["outpaint_amount"] if amount is None else float(amount)
+    amt = min(max(amt, 0.1), 1.0)
+    n_steps = int(steps) if steps else int(CFG["outpaint_steps"])
+    pipe = _load_inpaint_pipe()
+    import torch
+    from PIL import Image, ImageDraw
+    reap_old()
+    src = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    ow, oh = src.size
+    p = plan_outpaint(ow, oh, direction, amt)
+    base = src.resize((p["bw"], p["bh"]), Image.LANCZOS)
+    canvas = Image.new("RGB", (p["nw"], p["nh"]), (255, 255, 255))
+    canvas.paste(base, (p["l"], p["t"]))
+    mask = Image.new("L", (p["nw"], p["nh"]), 255)   # white = fill, black = keep
+    ImageDraw.Draw(mask).rectangle(
+        [p["l"], p["t"], p["l"] + p["bw"] - 1, p["t"] + p["bh"] - 1], fill=0)
+    try:
+        mask = pipe.mask_processor.blur(mask, blur_factor=8)  # soften the seam
+    except Exception:
+        pass
+    with GEN_LOCK:
+        t0 = time.time()
+        with torch.no_grad():
+            result = pipe(prompt=prompt, image=canvas, mask_image=mask,
+                          num_inference_steps=n_steps, guidance_scale=INPAINT_GUIDANCE,
+                          strength=1.0, height=p["nh"], width=p["nw"])
+        out = result.images[0].convert("RGB")
+        out.paste(base, (p["l"], p["t"]))   # keep original region pixel-exact
+        nsfw = _flagged_nsfw(result)
+        logger.info("outpaint in %.1fs (%s +%.0f%% -> %dx%d, steps=%d, nsfw=%s)",
+                    time.time() - t0, direction, amt * 100, p["nw"], p["nh"], n_steps, nsfw)
+    if nsfw:
+        raise ValueError("blocked_nsfw")
+    image_id = f"img_{uuid.uuid4().hex[:10]}"
+    path = os.path.join(OUT_DIR, image_id + ".png")
+    out.save(path)
     return image_id, path
 
 
@@ -166,27 +439,82 @@ def publish_tts(text, source=None):
     client.publish("tts/request", json.dumps(payload), qos=1)
 
 
-def publish_state(status, **extra):
-    payload = {
-        "skill": SKILL,
-        "timestamp": utc_now_iso(),
-        "status": status,
-        "model": MODEL_NAME,
-        "safety": not ENABLE_NSFW,  # True = safety ON, False = safety OFF
-        "size": SIZE,
-        "steps": STEPS
+def config_snapshot():
+    """Current effective config + model catalog, for the UI."""
+    m = cur_model()
+    return {
+        "models": [{"key": k, "label": v["label"]} for k, v in MODELS.items()],
+        "model_key": CFG["model_key"],
+        "model_label": m["label"],
+        "nsfw": bool(CFG["nsfw"]),
+        "steps": cur_steps(),
+        "strength": round(float(CFG["strength"]), 2),
+        "outpaint_steps": int(CFG["outpaint_steps"]),
+        "outpaint_amount": round(float(CFG["outpaint_amount"]), 2),
+        "ready": READY.is_set(),
     }
+
+
+def publish_state(status, **extra):
+    payload = {"skill": SKILL, "timestamp": utc_now_iso(), "status": status, "size": SIZE}
+    payload.update(config_snapshot())
+    payload["safety"] = not CFG["nsfw"]  # back-compat field
     payload.update(extra)
     client.publish(f"skill/{SKILL}/state", json.dumps(payload), qos=1, retain=True)
 
 
+def apply_config(patch):
+    """Apply a partial config update. Returns (snapshot, reloaded_bool)."""
+    reload_needed = False
+    with CFG_LOCK:
+        if "model_key" in patch and patch["model_key"] in MODELS \
+                and patch["model_key"] != CFG["model_key"]:
+            CFG["model_key"] = patch["model_key"]
+            reload_needed = True
+        if "nsfw" in patch:
+            nv = bool(patch["nsfw"])
+            if nv != CFG["nsfw"]:
+                CFG["nsfw"] = nv
+                reload_needed = True
+        if "steps" in patch and patch["steps"] is not None:
+            try:
+                CFG["steps"] = max(1, min(12, int(patch["steps"])))
+            except (TypeError, ValueError):
+                pass
+        if "strength" in patch and patch["strength"] is not None:
+            try:
+                CFG["strength"] = max(0.1, min(1.0, float(patch["strength"])))
+            except (TypeError, ValueError):
+                pass
+        if "outpaint_steps" in patch and patch["outpaint_steps"] is not None:
+            try:
+                CFG["outpaint_steps"] = max(4, min(40, int(patch["outpaint_steps"])))
+            except (TypeError, ValueError):
+                pass
+        if "outpaint_amount" in patch and patch["outpaint_amount"] is not None:
+            try:
+                CFG["outpaint_amount"] = max(0.1, min(1.0, float(patch["outpaint_amount"])))
+            except (TypeError, ValueError):
+                pass
+        save_config()
+    if reload_needed:
+        reload_async()
+    return config_snapshot(), reload_needed
+
+
 def handle_request(req):
     prompt = (req.get("prompt") or req.get("text") or "").strip()
-    # An addon-matched request carries data from the manifest's named groups.
     data = req.get("data") or {}
     if not prompt and data.get("subject"):
         prompt = data["subject"].strip()
-    machine = (req.get("machine") or data.get("machine") or DEFAULT_PC).strip() or DEFAULT_PC
+    machine = (req.get("machine") or data.get("machine") or "").strip()
+    # A trailing "on laptop/desktop" is the target machine, not part of the image.
+    _mt = re.search(r"\s+on\s+(desktop|laptop)\s*$", prompt, re.I)
+    if _mt:
+        if not machine:
+            machine = _mt.group(1).lower()
+        prompt = prompt[:_mt.start()].strip()
+    machine = machine or DEFAULT_PC
     source = req.get("source")
     if not prompt:
         publish_tts("What should I generate an image of?", source)
@@ -217,8 +545,9 @@ def handle_request(req):
 def on_connect(client, userdata, flags, reason_code, properties):
     logger.info("Connected to MQTT %s:%s", MQTT_HOST, MQTT_PORT)
     client.subscribe(f"skill/{SKILL}/request", qos=1)
-    logger.info("Subscribed to skill/%s/request", SKILL)
-    publish_state("ready")
+    client.subscribe(f"skill/{SKILL}/config/set", qos=1)
+    logger.info("Subscribed to skill/%s/request and /config/set", SKILL)
+    publish_state("ready" if READY.is_set() else "loading")
 
 
 def on_message(client, userdata, msg):
@@ -226,6 +555,9 @@ def on_message(client, userdata, msg):
         if msg.topic == f"skill/{SKILL}/request":
             req = json.loads(msg.payload.decode() or "{}")
             threading.Thread(target=handle_request, args=(req,), daemon=True).start()
+        elif msg.topic == f"skill/{SKILL}/config/set":
+            patch = json.loads(msg.payload.decode() or "{}")
+            apply_config(patch)
     except Exception as e:
         logger.exception("on_message: %s", e)
 
@@ -234,17 +566,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if not self.path.startswith("/img/"):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        if path == "/config":
+            self._json(config_snapshot()); return
+        if not path.startswith("/img/"):
             self.send_error(404); return
-        name = os.path.basename(self.path[len("/img/"):])
+        name = os.path.basename(path[len("/img/"):])
         if not name.endswith(".png") or "/" in name or "\\" in name:
             self.send_error(400); return
-        path = os.path.join(OUT_DIR, name)
-        if not os.path.exists(path):
+        fpath = os.path.join(OUT_DIR, name)
+        if not os.path.exists(fpath):
             self.send_error(404, "expired or unknown"); return
         try:
-            with open(path, "rb") as f:
+            with open(fpath, "rb") as f:
                 data = f.read()
         except OSError:
             self.send_error(404); return
@@ -255,6 +600,127 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_POST(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length > 0 else b""
+
+        if parsed.path == "/config":
+            try:
+                patch = json.loads(body.decode() or "{}")
+            except Exception:
+                self._json({"ok": False, "error": "bad json"}, 400); return
+            snap, reloaded = apply_config(patch)
+            snap["ok"] = True
+            snap["reloading"] = reloaded
+            self._json(snap); return
+
+        if parsed.path == "/generate":
+            q = parse_qs(parsed.query)
+            prompt = (q.get("prompt", [""])[0]).strip()
+            steps_raw = q.get("steps", [None])[0]
+            if not prompt:
+                self.send_error(400, "missing prompt"); return
+            try:
+                image_id, path = generate(prompt, steps_raw)
+            except ValueError as ve:
+                if str(ve) == "blocked_nsfw":
+                    self.send_error(403, "blocked by safety filter"); return
+                self.send_error(400, str(ve)); return
+            except Exception as e:
+                logger.exception("generate failed: %s", e)
+                self.send_error(500, "generation failed"); return
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self.send_error(500); return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            logger.info("Served text2img %s", image_id)
+            return
+
+        if parsed.path == "/outpaint":
+            q = parse_qs(parsed.query)
+            prompt = (q.get("prompt", [""])[0]).strip()
+            direction = (q.get("direction", ["down"])[0]).strip().lower()
+            amount_raw = q.get("amount", [None])[0]   # None -> CFG default
+            try:
+                amount = float(amount_raw) if amount_raw not in (None, "") else None
+            except ValueError:
+                amount = None
+            steps_raw = q.get("steps", [None])[0]
+            if length <= 0:
+                self.send_error(400, "no image body"); return
+            if not prompt:
+                prompt = "extend the image, same style"
+            if direction not in ("down", "up", "left", "right", "all"):
+                direction = "down"
+            try:
+                image_id, path = generate_outpaint(prompt, body, direction, amount, steps_raw)
+            except ValueError as ve:
+                if str(ve) == "blocked_nsfw":
+                    self.send_error(403, "blocked by safety filter"); return
+                self.send_error(400, str(ve)); return
+            except Exception as e:
+                logger.exception("outpaint failed: %s", e)
+                self.send_error(500, "outpaint failed"); return
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self.send_error(500); return
+            url = f"http://{HOST_ADDR}:{HTTP_PORT}/img/{image_id}.png"
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Image-Url", url)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            logger.info("Served outpaint %s -> %s", image_id, url)
+            return
+
+        if parsed.path != "/edit":
+            self.send_error(404); return
+
+        q = parse_qs(parsed.query)
+        prompt = (q.get("prompt", [""])[0]).strip()
+        strength_raw = q.get("strength", [None])[0]
+        steps_raw = q.get("steps", [None])[0]
+        if length <= 0:
+            self.send_error(400, "no image body"); return
+        if not prompt:
+            self.send_error(400, "missing prompt"); return
+        try:
+            image_id, path = generate_img2img(prompt, body, strength_raw, steps_raw)
+        except ValueError as ve:
+            if str(ve) == "blocked_nsfw":
+                self.send_error(403, "blocked by safety filter"); return
+            self.send_error(400, str(ve)); return
+        except Exception as e:
+            logger.exception("img2img failed: %s", e)
+            self.send_error(500, "generation failed"); return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(500); return
+        url = f"http://{HOST_ADDR}:{HTTP_PORT}/img/{image_id}.png"
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Image-Url", url)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+        logger.info("Served img2img %s -> %s", image_id, url)
+
 
 def serve_http():
     httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
@@ -263,9 +729,12 @@ def serve_http():
 
 
 if __name__ == "__main__":
+    load_config()
+    m = cur_model()
     logger.info("JAY Image Generation Addon starting "
-                "(model=%s, steps=%d, size=%d, threads=%d, safety=%s)",
-                MODEL_NAME, STEPS, SIZE, IMAGE_THREADS, "ON" if not ENABLE_NSFW else "OFF")
+                "(model=%s, steps=%d, strength=%.2f, size=%d, threads=%d, safety=%s)",
+                m["label"], cur_steps(), CFG["strength"], SIZE, IMAGE_THREADS,
+                "ON" if not CFG["nsfw"] else "OFF")
     threading.Thread(target=serve_http, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
     threading.Thread(target=_load_pipe, daemon=True).start()
