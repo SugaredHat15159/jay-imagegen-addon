@@ -75,7 +75,7 @@ SKILL = os.getenv("IMAGE_SKILL_TOPIC", "imagegen")
 
 # Outpainting / inpainting uses a dedicated inpaint checkpoint (standard SD1.5,
 # not LCM) so it needs more steps + normal guidance than the LCM gen models.
-INPAINT_MODEL_ID = os.getenv("IMAGE_INPAINT_MODEL", "Lykon/dreamshaper-5-inpainting")
+INPAINT_MODEL_ID = os.getenv("IMAGE_INPAINT_MODEL", "stable-diffusion-v1-5/stable-diffusion-inpainting")
 INPAINT_STEPS = int(os.getenv("INPAINT_STEPS", "24"))
 INPAINT_GUIDANCE = float(os.getenv("INPAINT_GUIDANCE", "7.5"))
 OUTPAINT_CAP = int(os.getenv("OUTPAINT_CAP", "768"))   # max long side of the extended canvas
